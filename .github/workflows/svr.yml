@@ -26,7 +26,9 @@ jobs:
           cache: false
 
       - name: Create workspace
-        run: go work init ./packages/greet ./apps/hello
+        run: |
+          go work init
+          go work use -r .
 
       - name: Check formatting
         run: |

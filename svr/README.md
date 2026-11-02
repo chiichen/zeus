@@ -7,11 +7,12 @@ Go workspace for server modules.
 - `packages/` holds library modules only. They must not contain `package main` or a `main` function.
 - `apps/` holds application modules. Each one builds a runnable binary (`package main`).
 
-The modules are committed. The workspace file is local. After clone, create it from `svr/` so the app resolves the library on disk:
+The modules are committed. The workspace file is local. `go work init` takes module directories and does not expand `*` or `./...`. After clone, create the workspace from `svr/` and add every module under it:
 
 ```bash
 cd svr
-go work init ./packages/greet ./apps/hello
+go work init
+go work use -r .
 ```
 
 `go.work.sum` may appear locally after `go work sync` or a build. Leave `go.work` and `go.work.sum` untracked.
