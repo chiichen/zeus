@@ -1,0 +1,54 @@
+name: svr
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: svr
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          cache: false
+
+      - name: Create workspace
+        run: go work init ./packages/greet ./apps/hello
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would change:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Test
+        run: go test ./apps/hello ./packages/greet
+
+      - name: Build
+        run: |
+          go build -o "$RUNNER_TEMP/hello" ./apps/hello
+          go build ./packages/greet
+
+      - name: Vet
+        run: go vet ./apps/hello ./packages/greet
+
+      - name: staticcheck
+        run: |
+          GOWORK=off go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+          staticcheck ./apps/hello ./packages/greet
