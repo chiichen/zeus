@@ -25,6 +25,10 @@ profile.cov
 go.work
 go.work.sum
 
+# The svr monorepo commits its workspace so local module wiring is shared.
+!svr/go.work
+!svr/go.work.sum
+
 # env file
 .env
 
