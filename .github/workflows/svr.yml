@@ -40,17 +40,15 @@ jobs:
           fi
 
       - name: Test
-        run: go test ./apps/hello ./packages/greet
+        run: go test work
 
       - name: Build
-        run: |
-          go build -o "$RUNNER_TEMP/hello" ./apps/hello
-          go build ./packages/greet
+        run: go build work
 
       - name: Vet
-        run: go vet ./apps/hello ./packages/greet
+        run: go vet work
 
       - name: staticcheck
         run: |
           GOWORK=off go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
-          staticcheck ./apps/hello ./packages/greet
+          staticcheck work
