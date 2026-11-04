@@ -16,7 +16,7 @@
 - 一次调用的终点是一台具体下游地址。拦截器直连这台机器。
 - RPC 热路径只读内存快照。Consul 由后台 watch 更新快照。
 - Prod 与 Dev 在解析时硬隔离。Dev 内按泳道隔离，泳道之间不回退。同一泳道内，配置按 `routeKey` 回退，回退不改变泳道。
-- Dev 用 `routeKey` 做一致性哈希，使同一个 `routeKey` 在实例集合不变时落在同一台下游。
+- 选实例有两种策略，`roundRobin` 与 `consistentHash`，由和路由文档一起加载的配置决定，不按环境写死。一致性哈希是通用算法，Prod 和 Dev 都可以选用。
 - 单元测试不连接 Consul，CI 现有 `go test work` 能覆盖解析顺序。
 
 ### 非目标
@@ -157,6 +157,7 @@ type Registrar interface {
 | confKey | 作用 |
 | --- | --- |
 | `route/v1/{service}` | 可选版本钉 |
+| `pick/v1/{service}` | 选实例策略。两种环境都读它 |
 | `gray/v1/{service}/{grayID}` | 灰度计划。同一服务、同一配置层同时只有一份 `status=running` |
 | `change/v1/{service}/{changeID}` | 容器变更 |
 
@@ -232,7 +233,22 @@ func bucket(grayID, uid string) int {
 - 同一配置层有两条及以上 `active` 变更：解析失败。
 - 部分流量只由灰度的 `percent` 表达。变更文档不带权重。
 
-Dev 里「配置层」是泳道加上回退停住的那个 `routeKey`。版本钉、灰度集合、变更集合各自独立回退：某一类文档在更具体的 `routeKey` 上不存在时，才用链上的下一层。不要把两层的灰度计划并成一份。
+选实例策略：
+
+```json
+{
+  "strategy": "roundRobin"
+}
+```
+
+`strategy` 只接受 `roundRobin` 和 `consistentHash`。文档不存在，或 `strategy` 为空，默认 `roundRobin`。其他字符串是非法配置，按解码失败处理，不安装新快照。Prod 的键是 `zeus/prod/pick/v1/{service}`。Dev 的键是 `zeus/dev/{lane}/{routeKey}/pick/v1/{service}`，和版本钉、灰度、变更一样按 `routeKey` 独立回退。策略不写死在某个环境里。
+
+`consistentHash` 的哈希键：
+
+- Dev：链上的主 `routeKey`（第一项）。配置回退到更低一层时，哈希键不变。
+- Prod：路径里没有 `routeKey`。有 appid 或 uid 时，哈希键是 `{appid}:{uid}`，缺的维度写成 `0`。两个都没有时，哈希键是 `"0"`。不把泳道或 `x-zeus-routekey` 编进 Prod 的哈希键，也不按这个字符串回退配置。
+
+Dev 里「配置层」是泳道加上回退停住的那个 `routeKey`。版本钉、选实例策略、灰度集合、变更集合各自独立回退：某一类文档在更具体的 `routeKey` 上不存在时，才用链上的下一层。不要把两层的灰度计划并成一份。
 
 ### 3.2 实例
 
@@ -258,6 +274,7 @@ KV：
 zeus/dev/0/42:10001/route/v1/order   不存在
 zeus/dev/0/42:0/route/v1/order       不存在
 zeus/dev/0/0:0/route/v1/order        = {"version":"20261103.1"}
+zeus/dev/0/0:0/pick/v1/order         = {"strategy":"consistentHash"}
 ```
 
 健康实例：
@@ -269,11 +286,11 @@ zeus/dev/0/0:0/route/v1/order        = {"version":"20261103.1"}
 | 10.0.0.4:9090 | dev | checkout | 20261103.1 |
 | 10.1.0.9:9090 | prod | 0 | 20261103.1 |
 
-解析：环境锁定为 `dev`，生产实例不参与。泳道锁定为 `"0"`，`checkout` 不参与，也不回退。`routeKey` 链是 `42:10001`、`42:0`、`0:0`。版本钉在 `0:0` 命中，版本锁定为 `20261103.1`。灰度与变更不再看。候选只有 `10.0.0.3:9090`。一致性哈希的输入是主 `routeKey` `42:10001`，不是回退命中的 `0:0`。
+解析：环境锁定为 `dev`，生产实例不参与。泳道锁定为 `"0"`，`checkout` 不参与，也不回退。`routeKey` 链是 `42:10001`、`42:0`、`0:0`。版本钉在 `0:0` 命中，版本锁定为 `20261103.1`。灰度与变更不再看。选实例策略也落在 `0:0`，是 `consistentHash`。候选只有 `10.0.0.3:9090`。哈希键是主 `routeKey` `42:10001`，不是回退命中的 `0:0`。
 
-同一进程上，appid `42`、uid `10002`、没有版本钉、没有灰度、没有 active 变更时，候选是泳道 `"0"` 上的全部健康实例。`42:10001` 与 `42:10002` 的哈希不同，可以落到不同地址；各自重复调用时，只要实例集合不变，就仍落在自己上次的那一台。
+同一进程上，appid `42`、uid `10002`、没有版本钉、没有灰度、没有 active 变更，且策略仍是 `consistentHash` 时，候选是泳道 `"0"` 上的全部健康实例。`42:10001` 与 `42:10002` 的哈希不同，可以落到不同地址；各自重复调用时，只要实例集合不变，就仍落在自己上次的那一台。若这一层没有 `pick` 文档，策略是默认的 `roundRobin`。
 
-Prod 进程不读 `zeus/dev/`。它只读 `zeus/prod/route/v1/order` 这类键，不按泳道和 `routeKey` 过滤，选机器时用轮询，不用一致性哈希。
+Prod 进程不读 `zeus/dev/`。它只读 `zeus/prod/{confKey}`，不按泳道和 `routeKey` 过滤。`zeus/prod/pick/v1/order` 决定策略。配成 `consistentHash` 时，哈希键是 `42:10001` 这种 `{appid}:{uid}`，两个都没有则是 `"0"`。配成 `roundRobin` 或缺这份文档时用轮询。
 
 ## 4. 解析顺序、优先级与失败策略
 
@@ -285,7 +302,7 @@ Prod 进程不读 `zeus/dev/`。它只读 `zeus/prod/route/v1/order` 这类键�
 
 1. **快照可用性。** 任一快照为空，或两者中较旧的 `LoadedAt` 超过 `maxStale`：返回 `Unavailable`。`LoadedAt` 是最近一次成功刷新的本地时间。
 2. **环境。** 使用进程的 `ZEUS_ENV`，只接受 `prod` 或 `dev`。metadata 里的 env 若非空且不一致：返回 `FailedPrecondition`。之后的键和实例都带这个 env。
-3. **Prod。** 忽略泳道、`routeKey`、appid、uid 的路径含义。uid 仍只作为灰度分桶的输入。配置只来自 `zeus/prod/{confKey}`。然后做第 6 步到第 8 步的版本选择，实例只保留 `env=prod`，不按泳道过滤。第 9 步用轮询。
+3. **Prod。** 忽略泳道和 `routeKey` 的路径含义。配置只来自 `zeus/prod/{confKey}`。appid 与 uid 不参与选键，只参与灰度分桶，以及 `consistentHash` 的哈希键。然后做第 6 步到第 9 步的版本选择，实例只保留 `env=prod`，不按泳道过滤。第 10 步按 `pick` 文档选策略。
 4. **Dev 泳道。** metadata 为空则为 `"0"`。泳道一旦选定就锁住。该泳道没有实例时不改去别的泳道，包括不回退到 `"0"`。
 5. **Dev 的 routeKey 链。**
    - 调用方给了非空 `routeKey`，且没有 appid、uid：链只有这一个字符串。
@@ -302,12 +319,12 @@ Prod 进程不读 `zeus/dev/`。它只读 `zeus/prod/route/v1/order` 这类键�
    - 选中候选版本但没有健康实例：改选基线版本，并计一次回退。基线也没有健康实例：`Unavailable`。
 8. **容器变更全量切换。** 没有生效灰度时，沿链找第一层含有该服务变更键的 `routeKey`。该层恰好一条 `active` 变更：全量选它的 `version`。没有健康实例则 `Unavailable`。两条及以上：`Unavailable`。
 9. **默认。** 当前 env 上、Dev 再加当前泳道的全部健康实例，不按版本过滤。没有实例则 `Unavailable`。
-10. **选一台。**
-    - Prod：匹配实例按 `Addr`、`ID` 排序。对键 `service|prod|version|reason` 做原子自增，取模得到下标。
-    - Dev：用一致性哈希。哈希输入是链上的主 `routeKey`（第一项），不是回退命中的那一层。实例按 `Addr`、`ID` 排序后，每个实例放 100 个虚节点，虚节点键是 `ID + "#" + strconv.Itoa(i)`。虚节点和 `routeKey` 都用 FNV-1a 64 位。`routeKey` 落在环上顺时针的下一个虚节点，该虚节点所属实例中选。集合按 `Addr`、`ID` 排序后再建环，结果与进程无关。
+10. **选一台。** 先沿与版本钉相同的规则读取 `pick/v1/{service}`。Prod 只有 `zeus/prod/pick/v1/{service}`。Dev 在当前泳道的 `routeKey` 链上取第一份存在的文档。没有文档或 `strategy` 为空时用 `roundRobin`。两种环境使用同一套策略，不因为环境改算法。
+    - `roundRobin`：匹配实例按 `Addr`、`ID` 排序。对键 `service|env|lane|version|reason` 做原子自增，取模得到下标。Prod 的 `lane` 这一段固定写 `-`。
+    - `consistentHash`：实例按 `Addr`、`ID` 排序后，每个实例放 100 个虚节点，虚节点键是 `ID + "#" + strconv.Itoa(i)`。虚节点和哈希键都用 FNV-1a 64 位。哈希键落在环上顺时针的下一个虚节点，该虚节点所属实例中选。集合先排序再建环，结果与进程无关。Dev 的哈希键是主 `routeKey`。Prod 的哈希键是 `{appid}:{uid}`，缺的维度写成 `0`；appid 和 uid 都没有时用 `"0"`。
     - 同一轮解析只选一台。
 
-第 6 步到第 8 步里，一旦版本被版本钉或全量变更钉死，就不再改版本。灰度是唯一允许「候选为空则回基线」的步骤。`routeKey` 回退只选择哪一层配置，不改变已经锁住的泳道，也不改变哈希用的主 `routeKey`。
+第 6 步到第 8 步里，一旦版本被版本钉或全量变更钉死，就不再改版本。灰度是唯一允许「候选为空则回基线」的步骤。Dev 的 `routeKey` 回退只选择哪一层配置，不改变已经锁住的泳道，也不改变哈希用的主 `routeKey`。Prod 没有这条回退。
 
 ### 4.2 未命中
 
@@ -322,7 +339,9 @@ Prod 进程不读 `zeus/dev/`。它只读 `zeus/prod/route/v1/order` 这类键�
 | 灰度基线也没有实例 | `Unavailable` | 没有剩余目标 |
 | 多条 `running` 灰度，或多条 `active` 变更，或灰度候选版本与变更版本不一致 | `Unavailable` | 配置有二义，不替操作者挑选 |
 | metadata env 与进程 env 不同 | `FailedPrecondition` | 隔离被破坏 |
-| Prod 请求带了泳道或 `routeKey` | 忽略这些字段，只读 `zeus/prod/` | Prod 没有这两段路径 |
+| Prod 请求带了泳道或 `routeKey` | 不把它们写入键路径，只读 `zeus/prod/` | Prod 没有这两段路径。`consistentHash` 仍用 appid 与 uid 组成哈希键 |
+| `pick` 文档缺失或 `strategy` 为空 | `roundRobin` | 默认策略 |
+| `strategy` 不是 `roundRobin` 或 `consistentHash` | 拒绝安装该快照 | 非法枚举 |
 
 ### 4.3 Consul 不可用
 
@@ -347,7 +366,7 @@ Prod 进程不读 `zeus/dev/`。它只读 `zeus/prod/route/v1/order` 这类键�
 
 部署上建议两个环境使用不同的 Consul ACL token：Prod 的 token 读不到 `zeus/dev/`，Dev 的 token 读不到 `zeus/prod/`。这是密钥边界。库本身仍按上面四层拒绝串环境。
 
-泳道、`routeKey`、appid/uid 回退和一致性哈希只在 Dev 生效。Prod 的路径是 `zeus/prod/{confKey}`，选实例用轮询。
+泳道、`routeKey` 路径和 appid/uid 的配置回退只在 Dev 生效。Prod 的路径是 `zeus/prod/{confKey}`。选实例策略两边都从 `pick/v1/{service}` 读取。
 
 ## 5. grpc-go 客户端拦截器
 
@@ -390,7 +409,7 @@ func StreamInterceptor(r *route.Router, service string, pool *Pool) grpc.StreamC
 
 同一次调用里，context 里的值优先于 metadata。
 
-拦截器把 **appid、uid、env、已经解析出的 lane、主 routeKey** 写进出站 metadata。不写选中的 IP，也不写版本，也不写回退命中的那一层 `routeKey`。下游用同一个主 `routeKey` 做自己的一致性哈希；泳道已经由上游定下来，下游即使慢一轮配置快照，也不会把人送进别的泳道。
+拦截器把 **appid、uid、env、已经解析出的 lane、主 routeKey** 写进出站 metadata。不写选中的 IP，也不写版本，也不写回退命中的那一层 `routeKey`。下游用同一套身份再算自己的哈希键：Dev 用主 `routeKey`，Prod 用 `{appid}:{uid}` 或 `"0"`。泳道已经由上游定下来，下游即使慢一轮配置快照，也不会把人送进别的泳道。下游自己的 `pick` 文档决定它用轮询还是一致性哈希。
 
 中游进程用一个服务端拦截器 `ForwardCallMeta` 把入站这些键放进 context。这也是进程内代码。每一跳各自解析自己的下游机器。
 
@@ -403,7 +422,7 @@ conn     = Pool.Get(Decision.Addr)
 return conn.Invoke 或 conn.NewStream，沿用原来的 ctx、方法和超时
 ```
 
-`Decision` 包含 `Addr`、`Env`、`Lane`、`RouteKey`、`Version`、`Reason`、`Pick`。`RouteKey` 是哈希用的主 `routeKey`；Prod 为空。`Reason` 取 `route`、`gray`、`change`、`default` 之一，表示版本从哪一步来。`Pick` 在 Dev 是 `hash`，在 Prod 是 `rr`。
+`Decision` 包含 `Addr`、`Env`、`Lane`、`RouteKey`、`HashKey`、`Version`、`Reason`、`Pick`。`RouteKey` 只在 Dev 有值，是配置链上的主 `routeKey`；Prod 为空。`HashKey` 是 `consistentHash` 的输入：Dev 等于主 `routeKey`，Prod 是 `{appid}:{uid}` 或 `"0"`。`Reason` 取 `route`、`gray`、`change`、`default` 之一，表示版本从哪一步来。`Pick` 取配置里的 `roundRobin` 或 `consistentHash`，缺省为 `roundRobin`。
 
 错误码：
 
@@ -412,7 +431,7 @@ return conn.Invoke 或 conn.NewStream，沿用原来的 ctx、方法和超时
 | 环境不一致 | `FailedPrecondition` |
 | 没有快照、快照过期、没有实例、配置二义 | `Unavailable` |
 
-v1 选中一台之后不再换机器。这一台拨号或 RPC 失败，错误返回给调用方。下一次调用按同一规则再选；Dev 上只要实例集合没变，同一主 `routeKey` 仍是这一台。
+v1 选中一台之后不再换机器。这一台拨号或 RPC 失败，错误返回给调用方。下一次调用按同一规则再选。策略是 `consistentHash` 且实例集合没变时，同一个 `HashKey` 仍是这一台。
 
 ### 5.4 与网关的边界
 
@@ -446,11 +465,11 @@ svr/packages/consuladapt/       github.com/chiichen/zeus/svr/packages/consuladap
 svr/packages/route/             github.com/chiichen/zeus/svr/packages/route
   go.mod                        只依赖 configkv、discovery
   meta.go                       CallMeta、metadata 键、字符集
-  model.go                      Route、Gray、Change 的 JSON
+  model.go                      Route、Pick、Gray、Change 的 JSON
   keys.go                       prod 与 dev 的键路径、routeKey 链
   snapshot.go                   快照构建、原子替换、maxStale
   resolve.go                    第 4 节的顺序
-  hash.go                       Dev 的一致性哈希环
+  hash.go                       两种环境共用的一致性哈希环
   resolve_test.go
   router.go                     启动 watch、等待首次加载
 
@@ -509,8 +528,8 @@ cc, err := grpc.NewClient(
 ### 阶段 2：模型与解析
 
 - 建立 `route`。
-- 实现键解析、JSON 解码、快照、第 4 节的全部顺序，以及 Dev 的一致性哈希。
-- 表驱动测试至少覆盖：Prod 只读 `zeus/prod/` 并忽略泳道和 `routeKey`；Dev 泳道默认 `"0"` 且不回退到其他泳道；`(appid:uid)` 命中后不再看更低层；缺文档时 `(appid:uid)` 落到 `(appid:0)` 再落到 `(0:0)`；没有 appid、uid 时只用 `"0"`；版本钉缺实例；灰度 allow/deny/percent；uid 为空留在基线；候选为空回基线；基线也为空；变更全量切换；变更与灰度版本不一致；多条 active 变更；环境不一致；快照缺失；超过 `maxStale`；同一主 `routeKey` 在集合不变时两次解析得到同一地址；Prod 走轮询而不是哈希。
+- 实现键解析、JSON 解码、快照、第 4 节的全部顺序，以及两种选实例策略。
+- 表驱动测试至少覆盖：Prod 只读 `zeus/prod/` 且键路径不含泳道和 `routeKey`；Dev 泳道默认 `"0"` 且不回退到其他泳道；`(appid:uid)` 命中后不再看更低层；缺文档时 `(appid:uid)` 落到 `(appid:0)` 再落到 `(0:0)`；没有 appid、uid 时只用 `"0"`；版本钉缺实例；灰度 allow/deny/percent；uid 为空留在基线；候选为空回基线；基线也为空；变更全量切换；变更与灰度版本不一致；多条 active 变更；环境不一致；快照缺失；超过 `maxStale`；`pick` 缺失时两种环境都是 `roundRobin`；Dev 的 `consistentHash` 用主 `routeKey` 而不是回退层；Prod 的 `consistentHash` 用 `{appid}:{uid}`，都没有时用 `"0"`；同一 `HashKey` 在集合不变时两次解析得到同一地址。
 - 用可注入的时钟测 `maxStale`。
 - 观察口先留一个空实现：
 
@@ -534,14 +553,14 @@ type Observer interface {
 
 - 建立 `grpcroute`。
 - 一元与流式拦截器、连接池、metadata 读取与转发、`ForwardCallMeta`。
-- `bufconn` 起两个后端。Dev 上主 `routeKey` 哈希指向其中一个地址时，断言只有该后端收到请求，且出站 metadata 里的 lane 与主 `routeKey` 是解析用的那一对。
+- `bufconn` 起两个后端。`consistentHash` 指向其中一个地址时，断言只有该后端收到请求。Dev 用例检查出站 metadata 里的 lane 与主 `routeKey`。Prod 用例检查哈希键是 `{appid}:{uid}`，并且没有按泳道过滤。
 - 环境不一致时断言 `FailedPrecondition`，且两个后端都没有收到请求。
 
 ### 明确推迟
 
 - 管理端、探测二进制、Prometheus 导出。
 - 同一 RPC 失败后改拨另一台。
-- 把 `routeKey` 写成一条存库的 IP 绑定。一致性哈希只对当前健康集合建环；实例进出时，只有环上被切开的那段 `routeKey` 会换机器。
+- 把哈希键写成一条存库的 IP 绑定。`consistentHash` 只对当前健康集合建环；实例进出时，只有环上被切开的那段哈希键会换机器。
 - 多数据中心、Consul prepared query、把 ACL 自动配进库里。
 - 写变更文档的发布系统，以及拉起容器的控制器。
 - 服务端业务拦截器之外的协议字段。不新增 proto；路由字段只走 metadata。
@@ -565,7 +584,7 @@ KV 与服务目录不是一个事务。灰度文档可以先于新版本实例�
 
 ### 实例列表过期
 
-健康检查通过，不代表进程此刻还活着。检查间隔 10s，加上 `maxStale` 30s，最坏情况下会在大约这个量级内继续选中已死地址。v1 不在失败后改拨。Dev 上同一 `routeKey` 会继续哈希到这台已死地址，直到它从健康集合消失；消失之后环重算，这个 `routeKey` 落到新的后继。
+健康检查通过，不代表进程此刻还活着。检查间隔 10s，加上 `maxStale` 30s，最坏情况下会在大约这个量级内继续选中已死地址。v1 不在失败后改拨。策略是 `consistentHash` 时，同一个 `HashKey` 会继续落到这台已死地址，直到它从健康集合消失；消失之后环重算，这个键落到新的后继。`roundRobin` 则下次取模时可能选到别的地址。
 
 watch 失败时禁止把空列表装进快照。空列表只在 Consul 明确返回「没有通过检查的实例」时装入。这两件事必须在适配器测试里分开。
 
